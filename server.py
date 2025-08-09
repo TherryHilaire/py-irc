@@ -1,8 +1,22 @@
 import socket
 import threading
 import time
-import select
 from collections import defaultdict
+
+class Channel:
+    def __init__(self, name):
+        self.name = name
+        self.members = set()
+        self.modes = {
+            't': True,   # Topic protection
+            'n': True,   # No external messages
+            's': False,  # Secret channel
+            'k': None,   # Password
+            'l': None    # User limit
+        }
+        self.topic = f"Welcome to {name}!"
+        self.creation_time = time.time()
+        self.ops = set()
 
 class IRCServer:
     def __init__(self, host='0.0.0.0', port=6667):
@@ -10,188 +24,217 @@ class IRCServer:
         self.port = port
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.channels = defaultdict(set)  # channel: set of clients
-        self.clients = {}  # client: {'nick': nick, 'channels': set}
-        self.nicknames = {}  # nick: client
+        self.channels = {
+            '#main': Channel('#main'),
+            '#general': Channel('#general'),
+            '#help': Channel('#help')
+        }
+        self.clients = {}  # {socket: {'nick': str, 'channels': set}}
+        self.nicknames = {}  # {nick: socket}
         self.running = True
-        self.start_time = time.time()
 
     def start(self):
         self.server.bind((self.host, self.port))
         self.server.listen()
-        print(f"🚀 Server started at {self.host}:{self.port}")
-        print(f"🕒 Server uptime: {self.get_uptime()}")
-        
-        try:
-            while self.running:
-                readable, _, _ = select.select([self.server] + list(self.clients.keys()), [], [], 1)
-                for sock in readable:
-                    if sock is self.server:
-                        self.accept_connection()
-                    else:
-                        self.handle_client(sock)
-        except KeyboardInterrupt:
-            print("\n🛑 Server shutting down...")
-        finally:
-            self.shutdown()
+        print(f"🚀 Server started on {self.host}:{self.port}")
+        print(f"Default channels: {', '.join(self.channels.keys())}")
+        self.accept_connections()
 
-    def get_uptime(self):
-        uptime = int(time.time() - self.start_time)
-        hours, remainder = divmod(uptime, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{hours}h {minutes}m {seconds}s"
-
-    def accept_connection(self):
-        client, addr = self.server.accept()
-        print(f"🔌 New connection from {addr}")
-        self.clients[client] = {'nick': None, 'channels': set()}
-        client.send("NOTICE Welcome to PyIRC Server!\r\n".encode('utf-8'))
-        client.send("NOTICE Please set your nickname with: /nick <nickname>\r\n".encode('utf-8'))
+    def accept_connections(self):
+        while self.running:
+            try:
+                client, addr = self.server.accept()
+                threading.Thread(target=self.handle_client, args=(client,)).start()
+            except OSError:
+                break
 
     def handle_client(self, client):
+        nick = None
         try:
-            data = client.recv(1024).decode('utf-8').strip()
-            if not data:
-                raise ConnectionError("Client disconnected")
-                
-            print(f"📩 Received: {data}")
-            
-            if data.startswith('NICK '):
-                self.handle_nick(client, data[5:])
-            elif data.startswith('JOIN '):
-                self.handle_join(client, data[5:])
-            elif data.startswith('PRIVMSG '):
-                self.handle_message(client, data[8:])
-            elif data == 'LIST':
-                self.handle_list(client)
-            elif data == 'QUIT':
-                self.remove_client(client)
-            elif data == 'TIME':
-                client.send(f"NOTICE Server time: {time.ctime()}\r\n".encode('utf-8'))
-            elif data == 'STATS':
-                stats = (
-                    f"NOTICE ⚡ Server Stats ⚡\r\n"
-                    f"NOTICE Uptime: {self.get_uptime()}\r\n"
-                    f"NOTICE Clients: {len(self.clients)}\r\n"
-                    f"NOTICE Channels: {len(self.channels)}\r\n"
-                )
-                client.send(stats.encode('utf-8'))
-            else:
-                client.send("NOTICE Unknown command\r\n".encode('utf-8'))
-        except Exception as e:
-            print(f"⚠️ Error: {e}")
-            self.remove_client(client)
+            while True:
+                data = client.recv(4096).decode('utf-8').strip()
+                if not data:
+                    break
+
+                if data.startswith('NICK '):
+                    nick = self.handle_nick(client, data[5:])
+                elif data.startswith('USER '):
+                    self.send_notice(client, "Welcome! Use /join #channel")
+                elif data.startswith('JOIN '):
+                    self.handle_join(client, data[5:])
+                elif data.startswith('MODE '):
+                    self.handle_mode(client, data[5:])
+                elif data.startswith('PRIVMSG '):
+                    self.handle_privmsg(client, data[8:])
+                elif data.startswith('WHOIS '):
+                    self.handle_whois(client, data[6:])
+                elif data == 'LIST':
+                    self.handle_list(client)
+                elif data.startswith('TOPIC '):
+                    self.handle_topic(client, data[6:])
+                elif data.startswith('KICK '):
+                    self.handle_kick(client, data[5:])
+                elif data == 'QUIT':
+                    break
+                elif data.startswith('PING'):
+                    client.send(f"PONG {data[5:]}\r\n".encode())
+        finally:
+            self.remove_client(client, nick)
 
     def handle_nick(self, client, nick):
         if nick in self.nicknames:
-            client.send(f"NOTICE Nickname '{nick}' is already in use\r\n".encode('utf-8'))
-            return
-            
-        old_nick = self.clients[client]['nick']
-        self.clients[client]['nick'] = nick
+            self.send_notice(client, f"Nickname {nick} is already in use")
+            return None
+        
+        if client in self.clients:
+            old_nick = self.clients[client].get('nick')
+            if old_nick:
+                del self.nicknames[old_nick]
+        
+        self.clients[client] = {'nick': nick, 'channels': set()}
         self.nicknames[nick] = client
-        
-        if old_nick:
-            del self.nicknames[old_nick]
-            self.broadcast(f"NOTICE {old_nick} is now known as {nick}", None)
-        client.send(f"NOTICE Your nickname is now {nick}\r\n".encode('utf-8'))
+        return nick
 
-    def handle_join(self, client, channel):
-        if not channel.startswith('#'):
-            channel = '#' + channel
-            
+    def handle_join(self, client, channel_name):
+        if not channel_name.startswith('#'):
+            channel_name = '#' + channel_name
+
+        if client not in self.clients:
+            self.send_notice(client, "Set your nickname first with NICK")
+            return
+
         nick = self.clients[client]['nick']
-        if not nick:
-            client.send("NOTICE Set your nickname first with /nick\r\n".encode('utf-8'))
-            return
-            
-        self.channels[channel].add(client)
-        self.clients[client]['channels'].add(channel)
         
-        # Notify channel
-        self.broadcast(f"NOTICE {nick} joined {channel}", channel)
-        client.send(f"JOIN {channel}\r\n".encode('utf-8'))
+        if channel_name not in self.channels:
+            self.channels[channel_name] = Channel(channel_name)
         
-        # Send topic
-        client.send(f"TOPIC {channel} :Welcome to {channel}!\r\n".encode('utf-8'))
-
-    def handle_message(self, client, data):
-        nick = self.clients[client]['nick']
-        if not nick:
-            client.send("NOTICE Set your nickname first with /nick\r\n".encode('utf-8'))
-            return
-            
-        target, _, message = data.partition(' ')
-        if not message:
-            return
-            
-        if target.startswith('#'):
-            # Channel message
-            if target in self.channels and client in self.channels[target]:
-                self.broadcast(f"PRIVMSG {nick} :{message}", target)
-            else:
-                client.send(f"NOTICE You're not in {target}\r\n".encode('utf-8'))
-        else:
-            # Private message
-            if target in self.nicknames:
-                self.nicknames[target].send(
-                    f"PRIVMSG {nick} :{message}\r\n".encode('utf-8')
-                )
-            else:
-                client.send(f"NOTICE User {target} not found\r\n".encode('utf-8'))
-
-    def handle_list(self, client):
-        response = "NOTICE 🟢 Active Channels:\r\n"
-        for channel, members in self.channels.items():
-            response += f"NOTICE {channel} ({len(members)} users)\r\n"
-        client.send(response.encode('utf-8'))
-
-    def broadcast(self, message, channel, exclude=None):
-        targets = []
-        if channel:
-            targets = self.channels[channel]
-        else:
-            targets = self.clients.keys()
+        channel = self.channels[channel_name]
         
-        for target in targets:
-            if target != exclude:
-                try:
-                    target.send(f"{message}\r\n".encode('utf-8'))
-                except:
-                    self.remove_client(target)
+        # Check channel modes
+        if channel.modes['k']:
+            self.send_notice(client, "This channel requires a password")
+            return
+        if channel.modes['l'] and len(channel.members) >= channel.modes['l']:
+            self.send_notice(client, "Channel is full")
+            return
 
-    def remove_client(self, client):
+        channel.members.add(client)
+        self.clients[client]['channels'].add(channel_name)
+        
+        self.send_notice(client, f"Joined {channel_name}")
+        self.broadcast(f"{nick} joined {channel_name}", channel_name, exclude=client)
+
+    def handle_mode(self, client, data):
+        parts = data.split()
+        if len(parts) < 2:
+            return
+
+        channel = parts[0]
+        mode = parts[1]
+        
+        if channel not in self.channels:
+            self.send_notice(client, f"Channel {channel} doesn't exist")
+            return
+
+        if mode.startswith('+'):
+            if 'k' in mode and len(parts) > 2:
+                self.channels[channel].modes['k'] = parts[2]  # Set password
+            elif 'l' in mode and len(parts) > 2:
+                self.channels[channel].modes['l'] = int(parts[2])  # Set user limit
+        elif mode.startswith('-'):
+            if 'k' in mode:
+                self.channels[channel].modes['k'] = None  # Remove password
+
+        self.broadcast(f"MODE {channel} {mode}", channel)
+
+    def handle_privmsg(self, client, data):
         if client not in self.clients:
             return
-            
-        nick = self.clients[client]['nick']
-        channels = self.clients[client]['channels'].copy()
-        
-        if nick:
-            del self.nicknames[nick]
-            self.broadcast(f"NOTICE {nick} has quit", None)
-            
-        for channel in channels:
-            self.channels[channel].discard(client)
-            if not self.channels[channel]:
-                del self.channels[channel]
-            self.broadcast(f"NOTICE {nick} left {channel}", channel)
-        
-        del self.clients[client]
-        client.close()
-        print(f"🔌 Client disconnected: {nick if nick else 'Unknown'}")
 
-    def shutdown(self):
-        self.broadcast("NOTICE Server is shutting down!", None)
-        for client in list(self.clients.keys()):
+        nick = self.clients[client]['nick']
+        target, _, message = data.partition(' :')
+        
+        if target.startswith('#'):
+            if target in self.channels and client in self.channels[target].members:
+                self.broadcast(f"{nick} PRIVMSG {target} :{message}", target)
+        else:
+            if target in self.nicknames:
+                self.send_privmsg(self.nicknames[target], nick, message)
+
+    def handle_whois(self, client, nick):
+        if nick in self.nicknames:
+            target_client = self.nicknames[nick]
+            channels = ', '.join(self.clients[target_client]['channels'])
+            self.send_notice(client, f"{nick} is on channels: {channels}")
+        else:
+            self.send_notice(client, f"{nick}: No such user")
+
+    def handle_list(self, client):
+        for channel_name, channel in self.channels.items():
+            self.send_notice(client, f"{channel_name} ({len(channel.members)} users)")
+
+    def handle_topic(self, client, data):
+        channel, _, topic = data.partition(' :')
+        if channel in self.channels:
+            self.channels[channel].topic = topic
+            self.broadcast(f"TOPIC {channel} :{topic}", channel)
+
+    def handle_kick(self, client, data):
+        channel, _, rest = data.partition(' ')
+        target, _, reason = rest.partition(' :')
+        
+        if (channel in self.channels and 
+            client in self.channels[channel].members and
+            target in self.nicknames):
+            
+            target_client = self.nicknames[target]
+            if target_client in self.channels[channel].members:
+                self.channels[channel].members.remove(target_client)
+                self.send_notice(target_client, f"You were kicked from {channel}: {reason}")
+                self.broadcast(f"{target} was kicked by {self.clients[client]['nick']}", channel)
+
+    def broadcast(self, message, channel_name, exclude=None):
+        if channel_name in self.channels:
+            for client in self.channels[channel_name].members:
+                if client != exclude:
+                    try:
+                        client.send(f"{message}\r\n".encode('utf-8'))
+                    except:
+                        self.remove_client(client)
+
+    def send_notice(self, client, message):
+        try:
+            client.send(f"NOTICE :{message}\r\n".encode('utf-8'))
+        except:
             self.remove_client(client)
+
+    def send_privmsg(self, client, sender, message):
+        try:
+            client.send(f"{sender} PRIVMSG :{message}\r\n".encode('utf-8'))
+        except:
+            self.remove_client(client)
+
+    def remove_client(self, client, nick=None):
+        if client in self.clients:
+            if not nick:
+                nick = self.clients[client]['nick']
+            for channel in list(self.clients[client]['channels']):
+                if channel in self.channels and client in self.channels[channel].members:
+                    self.channels[channel].members.remove(client)
+                    self.broadcast(f"{nick} has left {channel}", channel)
+            if nick in self.nicknames:
+                del self.nicknames[nick]
+            del self.clients[client]
+            client.close()
+
+    def stop(self):
+        self.running = False
         self.server.close()
-        print("🛑 Server stopped")
 
 if __name__ == "__main__":
-    import sys
-    host = sys.argv[1] if len(sys.argv) > 1 else '0.0.0.0'
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 6667
-    
-    server = IRCServer(host, port)
-    server.start()
+    server = IRCServer()
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.stop()
+        print("\nServer stopped")
