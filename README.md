@@ -29,8 +29,7 @@ py-IRC is an IRC (Internet Relay Chat) solution implemented in Python, featuring
   - Broadcast messages to all connected users
 - 🛡️ **Ban System**: Prevents banned users from connecting
 - ⏱️ **Channel Tracking**: Records channel creation time
-
-## Getting Started
+- **SSL/TLS support**: More or so secure chat using SSL.
 
 ### Prerequisites
 - Python 3.6 or higher
@@ -38,25 +37,38 @@ py-IRC is an IRC (Internet Relay Chat) solution implemented in Python, featuring
 ### Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/py-irc.git
+   git clone https://github.com/TherryHilaire/py-irc.git
    cd py-irc
    ```
 
-### Running the Server
+## Quick Start
+
+### 1. Generate SSL Certificates (for testing)
 ```bash
-python server.py
+mkdir -p certs
+openssl req -x509 -newkey rsa:4096 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes -subj "/CN=localhost"
 ```
 
-The server will start on port 6667 by default. You'll see the admin console with `ADMIN>` prompt.
-
-### Running the Client
+### 2. Run the Server
 ```bash
-python client.py
+python server.py --host 0.0.0.0 --port 6667 --ssl-cert certs/cert.pem --ssl-key certs/key.pem
+```
+
+### 3. Run the Client
+```bash
+python client.py --ssl --no-ssl-verify
+```
+
+## Production Setup
+For production, replace the self-signed certificates with ones from Let's Encrypt:
+```bash
+certbot certonly --standalone -d yourdomain.com
 ```
 
 You'll be prompted to enter:
 - Server address (default: 127.0.0.1)
 - Server port (default: 6667)
+- Nickname (default randomly generated)
 
 ## Client Commands
 | Command         | Description                          | Example                     |

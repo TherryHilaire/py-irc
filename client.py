@@ -4,6 +4,8 @@ import time
 import sys
 import readline
 import select
+import ssl  # SSL ADDITION
+import argparse
 
 # ANSI color codes
 class Colors:
@@ -22,7 +24,7 @@ class Colors:
 class IRCClient:
     def __init__(self):
         self.sock = None
-        self.nick = f"guest{time.time() % 1000:.0f}"
+        self.nick = f"guest{int(time.time() % 1000)}"
         self.active_channel = None
         self.running = False
         self.input_prompt = "> "
@@ -57,18 +59,15 @@ class IRCClient:
         print("="*50)
 
     def parse_message(self, raw):
-        """Robust IRC message parser with proper formatting and colors"""
         if not raw:
             return None
         
-        # Handle PING immediately
         if raw.startswith('PING'):
             self.send_command(f"PONG {raw[5:]}")
             return None
         
         timestamp = f"{Colors.GRAY}[{time.strftime('%H:%M:%S')}]{Colors.RESET}"
         
-        # Handle ERROR messages (kicks/bans)
         if raw.startswith('ERROR'):
             try:
                 reason = raw.split(':', 1)[1].strip()
@@ -76,7 +75,6 @@ class IRCClient:
             except:
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Handle KICK messages
         if 'KICK' in raw:
             try:
                 parts = raw.split()
@@ -87,25 +85,23 @@ class IRCClient:
             except:
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Server messages (numeric replies)
         if raw.split()[0].isdigit():
             parts = raw.split()
             code = parts[0]
             message = raw[raw.find(':', 1)+1:] if ':' in raw else ' '.join(parts[3:])
             if code in ('001', '002', '003', '004', '005'):
                 return f"{timestamp} {Colors.GREEN}●{Colors.RESET} {message}"
-            elif code in ('372', '375', '376'):  # MOTD
+            elif code in ('372', '375', '376'):
                 return f"{timestamp} {Colors.BLUE}●{Colors.RESET} {message}"
-            elif code == '353':  # NAMES list
+            elif code == '353':
                 channel = parts[4]
                 names = message
                 return f"{timestamp} {Colors.CYAN}Users in {channel}:{Colors.RESET} {names}"
-            elif code == '366':  # End of NAMES
+            elif code == '366':
                 return None
             else:
                 return f"{timestamp} {Colors.YELLOW}●{Colors.RESET} {message}"
         
-        # Handle NOTICE messages
         if 'NOTICE' in raw:
             try:
                 if ':' in raw:
@@ -116,26 +112,19 @@ class IRCClient:
             except:
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Handle PRIVMSG messages (both channel and private)
         if 'PRIVMSG' in raw:
             try:
-                # Extract sender nickname
                 sender_start = raw.find(':') + 1
-
-                # The prefix ends at the first space after sender_start
                 prefix_end = raw.find(' ', sender_start)
                 if prefix_end == -1:
                     prefix_end = len(raw)
-                # Extract the full prefix first
                 prefix = raw[sender_start:prefix_end]
-                # Now extract nick from prefix by finding '!' or use full prefix if no '!'
                 nick_end = prefix.find('!')
                 if nick_end == -1:
                     sender = prefix
                 else:
                     sender = prefix[:nick_end]
                 
-                # Extract target and message
                 msg_start = raw.find('PRIVMSG ') + 8
                 target_end = raw.find(' ', msg_start)
                 if target_end == -1:
@@ -145,21 +134,17 @@ class IRCClient:
                 content_start = raw.find(':', target_end) + 1
                 message = raw[content_start:]
                 
-                # Handle CTCP ACTION (/me commands)
                 if message.startswith('\x01ACTION') and message.endswith('\x01'):
                     action = message[7:-1]
                     return f"{timestamp} {Colors.MAGENTA}*{Colors.RESET} {Colors.YELLOW}{sender}{Colors.RESET} {action}"
                 
-                # Format based on message type
                 if target.startswith('#'):
                     return f"{timestamp} {Colors.BLUE}<{target}>{Colors.RESET} {Colors.YELLOW}<{sender}>{Colors.RESET}: {message}"
                 else:
                     return f"{timestamp} {Colors.MAGENTA}*{sender}*{Colors.RESET} {message}"
             except Exception:
-                # Fallback if parsing fails
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Handle JOIN messages
         elif 'JOIN' in raw:
             try:
                 sender_start = raw.find(':') + 1
@@ -176,7 +161,6 @@ class IRCClient:
             except:
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Handle PART messages
         elif 'PART' in raw:
             try:
                 sender_start = raw.find(':') + 1
@@ -193,7 +177,6 @@ class IRCClient:
             except:
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Handle QUIT messages
         elif 'QUIT' in raw:
             try:
                 sender_start = raw.find(':') + 1
@@ -205,7 +188,6 @@ class IRCClient:
             except:
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Handle NICK changes
         elif 'NICK' in raw:
             try:
                 sender_start = raw.find(':') + 1
@@ -219,9 +201,8 @@ class IRCClient:
             except:
                 return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
-        # Display all other messages with timestamp
         if raw.strip().startswith(':') and len(raw.strip().split()) == 1:
-            return None  # ignore prefix-only lines
+            return None
         return f"{timestamp} {raw}"
 
     def handle_server_message(self, message):
@@ -229,27 +210,22 @@ class IRCClient:
         if not formatted:
             return
     
-        # Preserve current user input
         try:
             current_buf = readline.get_line_buffer()
         except Exception:
             current_buf = ''
     
-        # Clear current input line
         sys.stdout.write('\r')
         sys.stdout.write(' ' * (len(self.input_prompt) + len(current_buf)))
         sys.stdout.write('\r')
     
-        # Print the incoming message
         print(formatted)
     
-        # If it's a kick/ban message, disconnect immediately
         if formatted and any(x in formatted for x in [Colors.RED + "*** ERROR", Colors.RED + "*** You have been kicked"]):
             print(f"{Colors.RED}Disconnecting from server...{Colors.RESET}")
             self.running = False
             return
     
-        # Redraw prompt and restore input buffer
         sys.stdout.write(self.input_prompt + current_buf)
         sys.stdout.flush()
 
@@ -268,7 +244,7 @@ class IRCClient:
             try:
                 data = self.sock.recv(4096).decode('utf-8')
                 if not data:
-                    self.running = False  # Server closed connection
+                    self.running = False
                     print(f"{Colors.RED}Connection closed by server{Colors.RESET}")
                     break
                     
@@ -277,9 +253,9 @@ class IRCClient:
                     line, buffer = buffer.split('\r\n', 1)
                     self.handle_server_message(line)
             except Exception as e:
-                if self.running:  # Only show error if we're supposed to be running
+                if self.running:
                     print(f"{Colors.RED}[ERROR] Receive error: {e}{Colors.RESET}")
-                self.running = False  # Set flag to stop client
+                self.running = False
                 break
 
     def handle_command(self, command):
@@ -368,9 +344,20 @@ class IRCClient:
             except Exception as e:
                 print(f"{Colors.RED}Input error: {e}{Colors.RESET}")
 
-    def connect(self, host, port):
+    def connect(self, host, port, use_ssl=False, ssl_verify=False, ssl_cert=None):  # SSL PARAMS ADDED
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            if use_ssl:
+                context = ssl.create_default_context()
+                if not ssl_verify:  # Skip verification for self-signed certs
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                elif ssl_cert:  # Use custom CA cert
+                    context.load_verify_locations(cafile=ssl_cert)
+                self.sock = context.wrap_socket(self.sock, server_hostname=host)
+            
+            nickname = input(f"Nickname [{self.nick}]: ") or self.nick
+            self.nick = nickname
             self.sock.connect((host, port))
             self.running = True
             self.show_welcome()
@@ -397,7 +384,19 @@ class IRCClient:
         print(f"{Colors.GREEN}Disconnected from server{Colors.RESET}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ssl", action="store_true", help="Enable SSL/TLS")
+    parser.add_argument("--no-ssl-verify", action="store_true", help="Disable SSL certificate verification (for testing)")
+    parser.add_argument("--ssl-cert", help="Path to custom CA cert (e.g., self-signed cert.pem)")
+    args = parser.parse_args()
+
     client = IRCClient()
     host = input("Server address [127.0.0.1]: ") or "127.0.0.1"
     port = int(input("Server port [6667]: ") or 6667)
-    client.connect(host, port)
+    client.connect(
+        host=host,
+        port=port,
+        use_ssl=args.ssl,
+        ssl_verify=not args.no_ssl_verify,
+        ssl_cert=args.ssl_cert
+    )

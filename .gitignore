@@ -1,2 +1,9 @@
 server.log
 .git
+.vscode
+__pycache__/
+*.py[cod]
+*$py.class
+/certs/
+*.pem
+.venv
