@@ -38,7 +38,7 @@ class IRCServer:
             
         self.clients = {}
         self.nicknames = {}
-        self.banned = set()
+        self.banned_ips = set()
         self.running = True
         self.log_file = "server.log"
         self.admin_password = "admin123"  # Change this in production
@@ -58,13 +58,6 @@ class IRCServer:
         if show:
             # Always show log messages in the console
             print(f"{Colors.GRAY}{log_entry}{Colors.RESET}")
-            # Redraw admin prompt if needed
-            self.redraw_admin_prompt()
-
-    def redraw_admin_prompt(self):
-        """Redraw the admin prompt if it should be visible"""
-        sys.stdout.write(f"\r{Colors.RED}ADMIN> {Colors.RESET}")
-        sys.stdout.flush()
 
     def start(self):
         self.server.bind((self.host, self.port))
@@ -92,15 +85,31 @@ class IRCServer:
             try:
                 client, addr = self.server.accept()
                 ip = addr[0]
+                
+                # Check if IP is banned
+                if ip in self.banned_ips:
+                    client.send(f"ERROR :Your IP has been banned from this server\r\n".encode())
+                    client.close()
+                    self.log(f"Banned IP tried to connect: {ip}")
+                    continue
+                    
                 self.log(f"New connection from {ip}")
                 threading.Thread(target=self.handle_client, args=(client, ip)).start()
             except OSError:
                 break
 
     def handle_client(self, client, ip):
+        # Add client immediately with IP as temporary identifier
+        self.clients[client] = {'nick': None, 'channels': set(), 'ip': ip}
+        
         nick = None
         try:
-            while True:
+            while self.running:
+                # Use select to check if there's data available
+                rlist, _, _ = select.select([client], [], [], 1.0)
+                if not rlist:
+                    continue
+                    
                 data = client.recv(4096).decode('utf-8').strip()
                 if not data:
                     break
@@ -133,21 +142,17 @@ class IRCServer:
             self.remove_client(client, nick, ip)
 
     def handle_nick(self, client, nick, ip):
-        if nick in self.banned:
-            client.send(f":server 433 * {nick} :You are banned from this server\r\n".encode())
-            self.log(f"Banned user tried to connect: {nick}")
-            return None
-            
         if nick in self.nicknames:
             client.send(f":server 433 * {nick} :Nickname is already in use\r\n".encode())
             return None
         
+        # Update nickname if already exists
         if client in self.clients:
             old_nick = self.clients[client].get('nick')
-            if old_nick:
+            if old_nick and old_nick in self.nicknames:
                 del self.nicknames[old_nick]
         
-        self.clients[client] = {'nick': nick, 'channels': set(), 'ip': ip}
+        self.clients[client]['nick'] = nick
         self.nicknames[nick] = client
         self.log(f"Nick registered: {nick} ({ip})")
         return nick
@@ -159,7 +164,7 @@ class IRCServer:
         if client not in self.clients:
             return
 
-        nick = self.clients[client]['nick']
+        nick = self.clients[client]['nick'] or ip
         
         if channel_name not in self.channels:
             self.channels[channel_name] = Channel(channel_name)
@@ -174,7 +179,7 @@ class IRCServer:
             member.send(f":{nick} JOIN {channel_name}\r\n".encode())
         
         # Send names list
-        names = ' '.join([self.clients[m]['nick'] for m in channel.members])
+        names = ' '.join([self.clients[m]['nick'] or self.clients[m]['ip'] for m in channel.members])
         client.send(f":server 353 {nick} = {channel_name} :{names}\r\n".encode())
         client.send(f":server 366 {nick} {channel_name} :End of /NAMES list\r\n".encode())
         
@@ -184,7 +189,7 @@ class IRCServer:
         if client not in self.clients:
             return
 
-        nick = self.clients[client]['nick']
+        nick = self.clients[client]['nick'] or ip
         target, _, message = data.partition(' :')
         
         if target.startswith('#'):
@@ -206,7 +211,7 @@ class IRCServer:
         if client not in self.clients:
             return
             
-        nick = self.clients[client]['nick']
+        nick = self.clients[client]['nick'] or ip
         if channel_name in self.channels and client in self.channels[channel_name].members:
             self.channels[channel_name].members.remove(client)
             self.clients[client]['channels'].remove(channel_name)
@@ -221,7 +226,8 @@ class IRCServer:
     def remove_client(self, client, nick, ip):
         if client in self.clients:
             if not nick:
-                nick = self.clients[client]['nick']
+                nick = self.clients[client].get('nick', ip)
+                
             for channel in list(self.clients[client]['channels']):
                 if channel in self.channels and client in self.channels[channel].members:
                     self.channels[channel].members.remove(client)
@@ -229,19 +235,23 @@ class IRCServer:
                     for member in self.channels[channel].members:
                         if member != client:
                             member.send(f":{nick} QUIT :Connection closed\r\n".encode())
-            if nick in self.nicknames:
-                del self.nicknames[nick]
+                            
+            # Remove nickname if exists
+            if 'nick' in self.clients[client] and self.clients[client]['nick'] in self.nicknames:
+                del self.nicknames[self.clients[client]['nick']]
+                
             del self.clients[client]
             client.close()
             self.log(f"Client disconnected: {nick} ({ip})")
 
     def admin_console(self):
         """Admin command interface"""
+        print()  # Start on a new line
+        
         while self.running:
             try:
-                sys.stdout.write(f"{Colors.RED}ADMIN> {Colors.RESET}")
-                sys.stdout.flush()
-                cmd = sys.stdin.readline().strip()
+                # Print prompt and get input in one step
+                cmd = input(f"{Colors.RED}ADMIN> {Colors.RESET}").strip()
                 if not cmd:
                     continue
                     
@@ -254,25 +264,25 @@ class IRCServer:
                     
                     if action == 'kick':
                         if len(parts) > 1:
-                            nick = parts[1]
+                            identifier = parts[1]
                             reason = ' '.join(parts[2:]) if len(parts) > 2 else "Kicked by admin"
-                            self.admin_kick(nick, reason)
+                            self.admin_kick(identifier, reason)
                         else:
-                            print(f"{Colors.RED}Usage: /kick <nick> [reason]{Colors.RESET}")
+                            print(f"{Colors.RED}Usage: /kick <nick|ip> [reason]{Colors.RESET}")
                     
                     elif action == 'ban':
                         if len(parts) > 1:
-                            nick = parts[1]
-                            self.admin_ban(nick)
+                            identifier = parts[1]
+                            self.admin_ban(identifier)
                         else:
-                            print(f"{Colors.RED}Usage: /ban <nick>{Colors.RESET}")
+                            print(f"{Colors.RED}Usage: /ban <nick|ip>{Colors.RESET}")
                     
                     elif action == 'unban':
                         if len(parts) > 1:
-                            nick = parts[1]
-                            self.admin_unban(nick)
+                            ip = parts[1]
+                            self.admin_unban(ip)
                         else:
-                            print(f"{Colors.RED}Usage: /unban <nick>{Colors.RESET}")
+                            print(f"{Colors.RED}Usage: /unban <ip>{Colors.RESET}")
                     
                     elif action == 'channels':
                         self.admin_list_channels()
@@ -316,36 +326,80 @@ class IRCServer:
             except Exception as e:
                 print(f"{Colors.RED}Admin error: {e}{Colors.RESET}")
 
-    def admin_kick(self, nick, reason):
-        """Kick a user from the server"""
-        if nick in self.nicknames:
-            client = self.nicknames[nick]
+    def admin_kick(self, identifier, reason):
+        """Kick a user from the server by nick or IP"""
+        # Try by nickname first
+        if identifier in self.nicknames:
+            client = self.nicknames[identifier]
+            nick = identifier
             client.send(f":server KICK {nick} :{reason}\r\n".encode())
+            client.send(f"ERROR :You have been kicked from the server: {reason}\r\n".encode())
             self.remove_client(client, nick, self.clients[client]['ip'])
             self.log(f"ADMIN: Kicked {nick} - {reason}", show=False)
             print(f"{Colors.GREEN}Kicked {nick}{Colors.RESET}")
+            return
+            
+        # Try by IP
+        client_to_kick = None
+        for client, info in self.clients.items():
+            if info['ip'] == identifier:
+                client_to_kick = client
+                break
+        
+        if client_to_kick:
+            ip = self.clients[client_to_kick]['ip']
+            nick = self.clients[client_to_kick].get('nick', ip)
+            client_to_kick.send(f":server KICK {nick} :{reason}\r\n".encode())
+            client_to_kick.send(f"ERROR :You have been kicked from the server: {reason}\r\n".encode())
+            self.remove_client(client_to_kick, nick, ip)
+            self.log(f"ADMIN: Kicked {ip} - {reason}", show=False)
+            print(f"{Colors.GREEN}Kicked {ip}{Colors.RESET}")
         else:
-            print(f"{Colors.RED}User not found: {nick}{Colors.RESET}")
+            print(f"{Colors.RED}User not found: {identifier}{Colors.RESET}")
 
-    def admin_ban(self, nick):
-        """Ban a user from the server"""
-        if nick in self.nicknames:
-            ip = self.clients[self.nicknames[nick]]['ip']
-            self.banned.add(nick)
-            self.admin_kick(nick, "Banned by admin")
-            self.log(f"ADMIN: Banned {nick} ({ip})", show=False)
-            print(f"{Colors.GREEN}Banned {nick}{Colors.RESET}")
+    def admin_ban(self, identifier):
+        """Ban a user from the server by nick or IP"""
+        # Try by nickname first
+        if identifier in self.nicknames:
+            client = self.nicknames[identifier]
+            ip = self.clients[client]['ip']
+            self.banned_ips.add(ip)
+            # Send ban notification and close connection
+            client.send(f"ERROR :Your IP has been banned from the server\r\n".encode())
+            self.remove_client(client, identifier, ip)
+            self.log(f"ADMIN: Banned {identifier} ({ip})", show=False)
+            print(f"{Colors.GREEN}Banned {identifier} ({ip}){Colors.RESET}")
+            return
+            
+        # Try by IP
+        client_to_ban = None
+        for client, info in self.clients.items():
+            if info['ip'] == identifier:
+                client_to_ban = client
+                break
+        
+        if client_to_ban:
+            ip = identifier
+            self.banned_ips.add(ip)
+            nick = self.clients[client_to_ban].get('nick', ip)
+            client_to_ban.send(f"ERROR :Your IP has been banned from the server\r\n".encode())
+            self.remove_client(client_to_ban, nick, ip)
+            self.log(f"ADMIN: Banned {ip}", show=False)
+            print(f"{Colors.GREEN}Banned {ip}{Colors.RESET}")
         else:
-            print(f"{Colors.RED}User not found: {nick}{Colors.RESET}")
+            # Ban IP even if no active connection
+            self.banned_ips.add(identifier)
+            self.log(f"ADMIN: Banned IP: {identifier}", show=False)
+            print(f"{Colors.GREEN}Banned IP: {identifier}{Colors.RESET}")
 
-    def admin_unban(self, nick):
-        """Unban a user"""
-        if nick in self.banned:
-            self.banned.remove(nick)
-            self.log(f"ADMIN: Unbanned {nick}", show=False)
-            print(f"{Colors.GREEN}Unbanned {nick}{Colors.RESET}")
+    def admin_unban(self, ip):
+        """Unban an IP address"""
+        if ip in self.banned_ips:
+            self.banned_ips.remove(ip)
+            self.log(f"ADMIN: Unbanned {ip}", show=False)
+            print(f"{Colors.GREEN}Unbanned {ip}{Colors.RESET}")
         else:
-            print(f"{Colors.RED}User not banned: {nick}{Colors.RESET}")
+            print(f"{Colors.RED}IP not banned: {ip}{Colors.RESET}")
 
     def admin_list_channels(self):
         """List all channels"""
@@ -422,6 +476,7 @@ class IRCServer:
             except:
                 pass
         
+        # Close server socket to unblock accept()
         self.server.close()
         self.log("Server stopped", show=False)
         print(f"{Colors.RED}Server stopped{Colors.RESET}")

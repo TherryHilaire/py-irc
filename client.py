@@ -3,6 +3,7 @@ import threading
 import time
 import sys
 import readline
+import select
 
 # ANSI color codes
 class Colors:
@@ -67,6 +68,25 @@ class IRCClient:
         
         timestamp = f"{Colors.GRAY}[{time.strftime('%H:%M:%S')}]{Colors.RESET}"
         
+        # Handle ERROR messages (kicks/bans)
+        if raw.startswith('ERROR'):
+            try:
+                reason = raw.split(':', 1)[1].strip()
+                return f"{timestamp} {Colors.RED}*** ERROR: {reason}{Colors.RESET}"
+            except:
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
+        
+        # Handle KICK messages
+        if 'KICK' in raw:
+            try:
+                parts = raw.split()
+                nick = parts[3]
+                channel = parts[2]
+                reason = raw.split(':', 1)[1] if ':' in raw else "No reason given"
+                return f"{timestamp} {Colors.RED}*** You have been kicked from {channel}: {reason}{Colors.RESET}"
+            except:
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
+        
         # Server messages (numeric replies)
         if raw.split()[0].isdigit():
             parts = raw.split()
@@ -84,6 +104,17 @@ class IRCClient:
                 return None
             else:
                 return f"{timestamp} {Colors.YELLOW}●{Colors.RESET} {message}"
+        
+        # Handle NOTICE messages
+        if 'NOTICE' in raw:
+            try:
+                if ':' in raw:
+                    message = raw.split(':', 1)[1].strip()
+                else:
+                    message = raw
+                return f"{timestamp} {Colors.GRAY}-NOTICE- {message}{Colors.RESET}"
+            except:
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
         
         # Handle PRIVMSG messages (both channel and private)
         if 'PRIVMSG' in raw:
@@ -212,6 +243,12 @@ class IRCClient:
         # Print the incoming message
         print(formatted)
     
+        # If it's a kick/ban message, disconnect immediately
+        if formatted and any(x in formatted for x in [Colors.RED + "*** ERROR", Colors.RED + "*** You have been kicked"]):
+            print(f"{Colors.RED}Disconnecting from server...{Colors.RESET}")
+            self.running = False
+            return
+    
         # Redraw prompt and restore input buffer
         sys.stdout.write(self.input_prompt + current_buf)
         sys.stdout.flush()
@@ -231,6 +268,8 @@ class IRCClient:
             try:
                 data = self.sock.recv(4096).decode('utf-8')
                 if not data:
+                    self.running = False  # Server closed connection
+                    print(f"{Colors.RED}Connection closed by server{Colors.RESET}")
                     break
                     
                 buffer += data
@@ -238,7 +277,9 @@ class IRCClient:
                     line, buffer = buffer.split('\r\n', 1)
                     self.handle_server_message(line)
             except Exception as e:
-                print(f"{Colors.RED}[ERROR] Receive error: {e}{Colors.RESET}")
+                if self.running:  # Only show error if we're supposed to be running
+                    print(f"{Colors.RED}[ERROR] Receive error: {e}{Colors.RESET}")
+                self.running = False  # Set flag to stop client
                 break
 
     def handle_command(self, command):
