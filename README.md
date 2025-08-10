@@ -1,7 +1,5 @@
 # py-IRC - Python IRC Client and Server
 
-![py-IRC Demo]
-
 py-IRC is an IRC (Internet Relay Chat) solution implemented in Python, featuring both a client and server with modern. This project brings the classic chat experience to life with an okay interface, basic administration tools, and comprehensive logging. It's mostly vibecoded so it there are any issues or security concerns feel free to open a pull request.
 
 ## Key Features
