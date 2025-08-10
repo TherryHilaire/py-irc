@@ -1,65 +1,228 @@
 import socket
 import threading
 import time
+import sys
 import readline
 
-class IRCClient:
-    COLOR_CODES = {
-        'white': '00',
-        'black': '01',
-        'blue': '02',
-        'green': '03',
-        'red': '04',
-        'brown': '05',
-        'purple': '06',
-        'orange': '07',
-        'yellow': '08',
-        'light_green': '09',
-        'cyan': '10',
-        'light_cyan': '11',
-        'light_blue': '12',
-        'pink': '13',
-        'gray': '14',
-        'light_gray': '15',
-        'reset': '\x0F'
-    }
+# ANSI color codes
+class Colors:
+    RESET = '\033[0m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    GRAY = '\033[90m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
+class IRCClient:
     def __init__(self):
         self.sock = None
         self.nick = f"guest{time.time() % 1000:.0f}"
         self.active_channel = None
         self.running = False
         self.input_prompt = "> "
+        self.commands = {
+            'join': "Join a channel: /join #channel",
+            'nick': "Change nickname: /nick newname",
+            'msg': "Send message: /msg target message",
+            'mode': "Set channel mode: /mode #channel [+/-mode] [args]",
+            'whois': "Get user info: /whois nickname",
+            'me': "Send action: /me action",
+            'list': "List channels: /list",
+            'part': "Leave channel: /part [#channel]",
+            'quit': "Disconnect: /quit",
+            'help': "Show this help: /help"
+        }
 
-    def connect(self, host, port):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def show_welcome(self):
+        print("="*50)
+        print(f"{Colors.BLUE} Welcome to py-IRC {Colors.RESET}".center(60, '#'))
+        print("="*50)
+        print(f"{Colors.GREEN}●{Colors.RESET} Connected to server")
+        print(f"{Colors.GREEN}●{Colors.RESET} Your nickname: {Colors.YELLOW}{self.nick}{Colors.RESET}")
+        print(f"{Colors.GREEN}●{Colors.RESET} Type {Colors.CYAN}/help{Colors.RESET} to see available commands")
+        print("="*50)
+
+    def show_help(self):
+        print("="*50)
+        print(f"{Colors.BLUE} Available Commands {Colors.RESET}".center(50))
+        print("="*50)
+        for cmd, desc in self.commands.items():
+            print(f"{Colors.CYAN}{desc}{Colors.RESET}")
+        print("="*50)
+
+    def parse_message(self, raw):
+        """Robust IRC message parser with proper formatting and colors"""
+        if not raw:
+            return None
+        
+        # Handle PING immediately
+        if raw.startswith('PING'):
+            self.send_command(f"PONG {raw[5:]}")
+            return None
+        
+        timestamp = f"{Colors.GRAY}[{time.strftime('%H:%M:%S')}]{Colors.RESET}"
+        
+        # Server messages (numeric replies)
+        if raw.split()[0].isdigit():
+            parts = raw.split()
+            code = parts[0]
+            message = raw[raw.find(':', 1)+1:] if ':' in raw else ' '.join(parts[3:])
+            if code in ('001', '002', '003', '004', '005'):
+                return f"{timestamp} {Colors.GREEN}●{Colors.RESET} {message}"
+            elif code in ('372', '375', '376'):  # MOTD
+                return f"{timestamp} {Colors.BLUE}●{Colors.RESET} {message}"
+            elif code == '353':  # NAMES list
+                channel = parts[4]
+                names = message
+                return f"{timestamp} {Colors.CYAN}Users in {channel}:{Colors.RESET} {names}"
+            elif code == '366':  # End of NAMES
+                return None
+            else:
+                return f"{timestamp} {Colors.YELLOW}●{Colors.RESET} {message}"
+        
+        # Handle PRIVMSG messages (both channel and private)
+        if 'PRIVMSG' in raw:
+            try:
+                # Extract sender nickname
+                sender_start = raw.find(':') + 1
+
+                # The prefix ends at the first space after sender_start
+                prefix_end = raw.find(' ', sender_start)
+                if prefix_end == -1:
+                    prefix_end = len(raw)
+                # Extract the full prefix first
+                prefix = raw[sender_start:prefix_end]
+                # Now extract nick from prefix by finding '!' or use full prefix if no '!'
+                nick_end = prefix.find('!')
+                if nick_end == -1:
+                    sender = prefix
+                else:
+                    sender = prefix[:nick_end]
+                
+                # Extract target and message
+                msg_start = raw.find('PRIVMSG ') + 8
+                target_end = raw.find(' ', msg_start)
+                if target_end == -1:
+                    target_end = raw.find(':', msg_start)
+                target = raw[msg_start:target_end].strip()
+                
+                content_start = raw.find(':', target_end) + 1
+                message = raw[content_start:]
+                
+                # Handle CTCP ACTION (/me commands)
+                if message.startswith('\x01ACTION') and message.endswith('\x01'):
+                    action = message[7:-1]
+                    return f"{timestamp} {Colors.MAGENTA}*{Colors.RESET} {Colors.YELLOW}{sender}{Colors.RESET} {action}"
+                
+                # Format based on message type
+                if target.startswith('#'):
+                    return f"{timestamp} {Colors.BLUE}<{target}>{Colors.RESET} {Colors.YELLOW}<{sender}>{Colors.RESET}: {message}"
+                else:
+                    return f"{timestamp} {Colors.MAGENTA}*{sender}*{Colors.RESET} {message}"
+            except Exception:
+                # Fallback if parsing fails
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
+        
+        # Handle JOIN messages
+        elif 'JOIN' in raw:
+            try:
+                sender_start = raw.find(':') + 1
+                sender_end = raw.find('!', sender_start)
+                if sender_end == -1:
+                    sender_end = raw.find(' ', sender_start)
+                sender = raw[sender_start:sender_end]
+                
+                channel_start = raw.find('JOIN') + 5
+                channel = raw[channel_start:].strip()
+                if channel.startswith(':'):
+                    channel = channel[1:]
+                return f"{timestamp} {Colors.GREEN}-->{Colors.RESET} {Colors.YELLOW}{sender}{Colors.RESET} joined {Colors.BLUE}{channel}{Colors.RESET}"
+            except:
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
+        
+        # Handle PART messages
+        elif 'PART' in raw:
+            try:
+                sender_start = raw.find(':') + 1
+                sender_end = raw.find('!', sender_start)
+                if sender_end == -1:
+                    sender_end = raw.find(' ', sender_start)
+                sender = raw[sender_start:sender_end]
+                
+                channel_start = raw.find('PART') + 5
+                channel = raw[channel_start:].strip()
+                if channel.startswith(':'):
+                    channel = channel[1:]
+                return f"{timestamp} {Colors.RED}<--{Colors.RESET} {Colors.YELLOW}{sender}{Colors.RESET} left {Colors.BLUE}{channel}{Colors.RESET}"
+            except:
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
+        
+        # Handle QUIT messages
+        elif 'QUIT' in raw:
+            try:
+                sender_start = raw.find(':') + 1
+                sender_end = raw.find('!', sender_start)
+                if sender_end == -1:
+                    sender_end = raw.find(' ', sender_start)
+                sender = raw[sender_start:sender_end]
+                return f"{timestamp} {Colors.RED}<--{Colors.RESET} {Colors.YELLOW}{sender}{Colors.RESET} disconnected"
+            except:
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
+        
+        # Handle NICK changes
+        elif 'NICK' in raw:
+            try:
+                sender_start = raw.find(':') + 1
+                sender_end = raw.find('!', sender_start)
+                if sender_end == -1:
+                    sender_end = raw.find(' ', sender_start)
+                old_nick = raw[sender_start:sender_end]
+                
+                new_nick = raw.split(':')[-1]
+                return f"{timestamp} {Colors.YELLOW}{old_nick}{Colors.RESET} is now known as {Colors.YELLOW}{new_nick}{Colors.RESET}"
+            except:
+                return f"{timestamp} {Colors.RED}{raw}{Colors.RESET}"
+        
+        # Display all other messages with timestamp
+        if raw.strip().startswith(':') and len(raw.strip().split()) == 1:
+            return None  # ignore prefix-only lines
+        return f"{timestamp} {raw}"
+
+    def handle_server_message(self, message):
+        formatted = self.parse_message(message)
+        if not formatted:
+            return
+    
+        # Preserve current user input
         try:
-            self.sock.connect((host, port))
-            self.running = True
-            print(f"Connected to {host}:{port}")
-            self.send_command(f"NICK {self.nick}")
-            self.send_command(f"USER {self.nick} 0 * :{self.nick}")
-            
-            receive_thread = threading.Thread(target=self.receive_loop)
-            receive_thread.daemon = True
-            receive_thread.start()
-            
-            self.input_loop()
-        except Exception as e:
-            print(f"Connection error: {e}")
-        finally:
-            self.disconnect()
-
-    def colorize(self, text, color):
-        if color in self.COLOR_CODES:
-            return f"\x03{self.COLOR_CODES[color]}{text}{self.COLOR_CODES['reset']}"
-        return text
+            current_buf = readline.get_line_buffer()
+        except Exception:
+            current_buf = ''
+    
+        # Clear current input line
+        sys.stdout.write('\r')
+        sys.stdout.write(' ' * (len(self.input_prompt) + len(current_buf)))
+        sys.stdout.write('\r')
+    
+        # Print the incoming message
+        print(formatted)
+    
+        # Redraw prompt and restore input buffer
+        sys.stdout.write(self.input_prompt + current_buf)
+        sys.stdout.flush()
 
     def send_command(self, command):
         try:
-            self.sock.send(f"{command}\r\n".encode('utf-8'))
+            if not command.endswith('\r\n'):
+                command += '\r\n'
+            self.sock.send(command.encode('utf-8'))
         except Exception as e:
-            print(f"Send error: {e}")
+            print(f"{Colors.RED}[ERROR] Send error: {e}{Colors.RESET}")
             self.running = False
 
     def receive_loop(self):
@@ -73,42 +236,74 @@ class IRCClient:
                 buffer += data
                 while '\r\n' in buffer:
                     line, buffer = buffer.split('\r\n', 1)
-                    self.handle_server_message(line.strip())
+                    self.handle_server_message(line)
             except Exception as e:
-                print(f"Receive error: {e}")
+                print(f"{Colors.RED}[ERROR] Receive error: {e}{Colors.RESET}")
                 break
 
-    def handle_server_message(self, message):
-        if message.startswith('PING'):
-            self.send_command(f"PONG {message[5:]}")
+    def handle_command(self, command):
+        parts = command.split()
+        if not parts:
             return
             
-        # Handle NOTICE messages
-        if message.startswith('NOTICE'):
-            _, content = message.split(':', 1)
-            print(f"\n{self.colorize('NOTICE', 'yellow')}: {content.strip()}")
-            return
-            
-        # Handle PRIVMSG formatting
-        if 'PRIVMSG' in message:
-            try:
-                prefix, content = message.split(':', 1)
-                nick = prefix.split('!')[0][1:]
-                target = prefix.split()[2]
-                
-                if '\x01ACTION' in content:  # Handle /me actions
-                    action = content.replace('\x01ACTION', '').replace('\x01', '')
-                    print(f"\n* {nick} {action}")
-                elif target.startswith('#'):
-                    print(f"\n{self.colorize(nick, 'green')} in {self.colorize(target, 'blue')}: {content}")
-                else:
-                    print(f"\n{self.colorize('PM from ' + nick, 'red')}: {content}")
-                return
-            except Exception as e:
-                print(f"Error parsing message: {e} - {message}")
-                
-        # Handle other messages
-        print(f"\n{message}")
+        cmd = parts[0].lower()
+        
+        if cmd == 'help':
+            self.show_help()
+        elif cmd == 'join':
+            if len(parts) > 1:
+                channel = parts[1]
+                if not channel.startswith('#'):
+                    channel = '#' + channel
+                self.send_command(f"JOIN {channel}")
+                self.active_channel = channel
+                self.input_prompt = f"{Colors.BLUE}[{channel}]{Colors.RESET}> "
+                print(f"{Colors.GREEN}Joined {channel}{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}Usage: /join #channel{Colors.RESET}")
+        elif cmd == 'nick':
+            if len(parts) > 1:
+                new_nick = parts[1]
+                self.send_command(f"NICK {new_nick}")
+                self.nick = new_nick
+                print(f"{Colors.GREEN}Nickname changed to {new_nick}{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}Usage: /nick newname{Colors.RESET}")
+        elif cmd == 'mode':
+            if len(parts) > 2:
+                self.send_command(f"MODE {' '.join(parts[1:])}")
+            else:
+                print(f"{Colors.RED}Usage: /mode #channel [+/-mode] [args]{Colors.RESET}")
+        elif cmd == 'whois':
+            if len(parts) > 1:
+                self.send_command(f"WHOIS {parts[1]}")
+            else:
+                print(f"{Colors.RED}Usage: /whois nickname{Colors.RESET}")
+        elif cmd == 'me':
+            if len(parts) > 1 and self.active_channel:
+                action = ' '.join(parts[1:])
+                self.send_command(f"PRIVMSG {self.active_channel} :\x01ACTION {action}\x01")
+            else:
+                print(f"{Colors.RED}Usage: /me action{Colors.RESET}")
+        elif cmd == 'list':
+            self.send_command("LIST")
+            print(f"{Colors.GREEN}Requested channel list{Colors.RESET}")
+        elif cmd == 'part':
+            channel = parts[1] if len(parts) > 1 else self.active_channel
+            if channel:
+                self.send_command(f"PART {channel}")
+                if channel == self.active_channel:
+                    self.active_channel = None
+                    self.input_prompt = "> "
+                print(f"{Colors.GREEN}Left {channel}{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}Not in any channel to part{Colors.RESET}")
+        elif cmd == 'quit':
+            self.send_command("QUIT")
+            self.running = False
+            print(f"{Colors.GREEN}Disconnecting...{Colors.RESET}")
+        else:
+            print(f"{Colors.RED}Unknown command: /{cmd}{Colors.RESET}")
 
     def input_loop(self):
         while self.running:
@@ -123,91 +318,45 @@ class IRCClient:
                     if self.active_channel:
                         self.send_command(f"PRIVMSG {self.active_channel} :{command}")
                     else:
-                        print("Not in any channel. Use /join #channel")
+                        print(f"{Colors.RED}Not in any channel. Use /join #channel{Colors.RESET}")
             except KeyboardInterrupt:
                 self.send_command("QUIT")
+                print(f"\n{Colors.GREEN}Disconnecting...{Colors.RESET}")
+                self.running = False
                 break
             except Exception as e:
-                print(f"Input error: {e}")
+                print(f"{Colors.RED}Input error: {e}{Colors.RESET}")
 
-    def handle_command(self, command):
-        parts = command.split()
-        if not parts:
-            return
+    def connect(self, host, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.connect((host, port))
+            self.running = True
+            self.show_welcome()
+            self.send_command(f"NICK {self.nick}")
+            self.send_command(f"USER {self.nick} 0 * :{self.nick}")
             
-        cmd = parts[0].lower()
-        
-        if cmd == 'join':
-            if len(parts) > 1:
-                channel = parts[1]
-                if not channel.startswith('#'):
-                    channel = '#' + channel
-                self.send_command(f"JOIN {channel}")
-                self.active_channel = channel
-                self.input_prompt = f"{self.colorize(channel, 'blue')}> "
-            else:
-                print("Usage: /join #channel")
-                
-        elif cmd == 'nick':
-            if len(parts) > 1:
-                self.send_command(f"NICK {parts[1]}")
-            else:
-                print("Usage: /nick newname")
-                
-        elif cmd == 'mode':
-            if len(parts) > 2:
-                self.send_command(f"MODE {' '.join(parts[1:])}")
-            else:
-                print("Usage: /mode #channel [+/-mode] [args]")
-                
-        elif cmd == 'whois':
-            if len(parts) > 1:
-                self.send_command(f"WHOIS {parts[1]}")
-            else:
-                print("Usage: /whois nickname")
-                
-        elif cmd == 'me':
-            if len(parts) > 1 and self.active_channel:
-                action = ' '.join(parts[1:])
-                self.send_command(f"PRIVMSG {self.active_channel} :\x01ACTION {action}\x01")
-                
-        elif cmd == 'list':
-            self.send_command("LIST")
+            receive_thread = threading.Thread(target=self.receive_loop)
+            receive_thread.daemon = True
+            receive_thread.start()
             
-        elif cmd == 'part':
-            channel = parts[1] if len(parts) > 1 else self.active_channel
-            if channel:
-                self.send_command(f"PART {channel}")
-                if channel == self.active_channel:
-                    self.active_channel = None
-                    self.input_prompt = "> "
-                    
-        elif cmd == 'quit':
-            self.send_command("QUIT")
-            self.running = False
-            
-        else:
-            print(f"Unknown command: /{cmd}")
+            self.input_loop()
+        except Exception as e:
+            print(f"{Colors.RED}Connection error: {e}{Colors.RESET}")
+        finally:
+            self.disconnect()
 
     def disconnect(self):
         self.running = False
         if self.sock:
-            self.sock.close()
-        print("Disconnected")
+            try:
+                self.sock.close()
+            except:
+                pass
+        print(f"{Colors.GREEN}Disconnected from server{Colors.RESET}")
 
 if __name__ == "__main__":
-    print("""
-       _____ _____   _____
-      |_   _|  __ \ / ____|
-        | | | |__) | |
-        | | |  _  /| |
-       _| |_| | \ \| |____
-      |_____|_|  \_\\_____|
-    """)
-    
+    client = IRCClient()
     host = input("Server address [127.0.0.1]: ") or "127.0.0.1"
     port = int(input("Server port [6667]: ") or 6667)
-    
-    client = IRCClient()
     client.connect(host, port)
-
